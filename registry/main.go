@@ -1,10 +1,17 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/mitchellh/mapstructure"
 	"github.com/shirou/gopsutil/cpu"
 	"github.com/shirou/gopsutil/disk"
@@ -78,19 +85,129 @@ type ProcessStat struct {
 	// MemoryMapsStat []process.MemoryMapsStat
 }
 
+type Message struct {
+	Type      string `json:"type"`
+	Sender    string `json:"sender"`
+	Recipient string `json:"recipient"`
+	Content   string `json:"content"`
+}
+
+var clients = make(map[*websocket.Conn]bool) // connected clients
+var broadcast = make(chan Message)           // broadcast channel
+
+// Define a welcome message for the server
+var welcomeMessage = Message{
+	Type:      "info",
+	Sender:    "Server",
+	Recipient: "All",
+	Content:   "Welcome to the chat!",
+}
+
 func main() {
-	l, err := net.Listen("tcp", ":8080")
-	if err != nil {
-		panic(err)
+	// Create a new Gorilla WebSocket router
+	router := http.NewServeMux()
+	router.HandleFunc("/ws", handleConnections)
+
+	// Create a HTTP server with graceful shutdown
+	server := &http.Server{
+		Addr:    ":8000",
+		Handler: router,
 	}
 
-	for {
-		daemonCluster, err := l.Accept()
-		if err != nil {
-			panic(err)
+	// Start the server in a separate goroutine
+	go func() {
+		log.Println("Server started on :8000")
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("ListenAndServe: %v", err)
 		}
+	}()
 
-		go handleConn(daemonCluster)
+	// Start handling messages
+	go handleMessages()
+
+	// Handle graceful shutdown
+	gracefulShutdown(server)
+}
+
+// handleConnections upgrades initial HTTP requests to WebSocket connections
+func handleConnections(w http.ResponseWriter, r *http.Request) {
+	// Upgrade initial GET request to a WebSocket
+	ws, err := websocket.Upgrade(w, r, nil, 1024, 1024)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	defer ws.Close()
+
+	// Register client
+	clients[ws] = true
+
+	// Send welcome message to client
+	err = ws.WriteJSON(welcomeMessage)
+	if err != nil {
+		log.Printf("error sending welcome message: %v", err)
+		return
+	}
+
+	// Read incoming messages from client
+	for {
+		var msg Message
+		err := ws.ReadJSON(&msg)
+		if err != nil {
+			log.Printf("error reading message: %v", err)
+			delete(clients, ws)
+			break
+		}
+		handleMessage(msg)
+	}
+}
+
+// handleMessage processes different types of messages
+func handleMessage(msg Message) {
+	switch msg.Type {
+	case "text":
+		broadcast <- msg
+	case "command":
+		// Handle command messages
+		fmt.Printf("Received command from %s: %s\n", msg.Sender, msg.Content)
+	default:
+		fmt.Printf("Unknown message type: %s\n", msg.Type)
+	}
+}
+
+// handleMessages broadcasts messages to all connected clients
+func handleMessages() {
+	for {
+		msg := <-broadcast
+		for client := range clients {
+			err := client.WriteJSON(msg)
+			if err != nil {
+				log.Printf("error writing message: %v", err)
+				client.Close()
+				delete(clients, client)
+			}
+		}
+	}
+}
+
+// gracefulShutdown handles server shutdown gracefully
+func gracefulShutdown(server *http.Server) {
+	// Create a channel to listen for interrupt and terminate signals
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt)
+
+	// Wait for the interrupt signal
+	<-stop
+
+	// Create a context with a timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Shutdown the server
+	if err := server.Shutdown(ctx); err != nil {
+		log.Printf("Shutdown: %v", err)
+	} else {
+		log.Println("Server gracefully stopped")
 	}
 }
 
@@ -112,13 +229,6 @@ func handleConn(daemonCluster net.Conn) {
 			switch schema.Kind {
 			case "connection":
 				handleDaemonClusterConnection(daemonCluster)
-			default:
-				fmt.Println("Unexpected Schema.Kind")
-			}
-		case "registry":
-			switch schema.Kind {
-			case "connection":
-				handleRegistryConnection(daemonCluster)
 			default:
 				fmt.Println("Unexpected Schema.Kind")
 			}
@@ -189,24 +299,19 @@ func handleConn(daemonCluster net.Conn) {
 }
 
 func handleDaemonClusterConnection(daemonCluster net.Conn) {
-	encoder := json.NewEncoder(daemonCluster)
-	if err := encoder.Encode(Schema{
+	b, err := json.Marshal(Schema{
 		Data: nil,
-		To:   "daemon cluster",
+		To:   "registry",
 		Kind: "connection",
-	}); err != nil {
-		fmt.Println("Error encoding JSON response:", err)
-		return
-	}
-}
-
-func handleRegistryConnection(daemonCluster net.Conn) {
-	encoder := json.NewEncoder(daemonCluster)
-	if err := encoder.Encode(request); err != nil {
-		fmt.Println("Error encoding JSON:", err)
-		return
+	})
+	if err != nil {
+		panic(err)
 	}
 
+	_, err = daemonCluster.Write(b)
+	if err != nil {
+		panic(err)
+	}
 }
 
 func handleDaemonClusterCPUStat(data map[string]interface{}) {

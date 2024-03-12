@@ -2,12 +2,14 @@ package main
 
 import (
 	"bufio"
-	"encoding/json"
 	"fmt"
-	"net"
-	"os/exec"
-	"runtime"
+	"log"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
 
+	"github.com/gorilla/websocket"
 	"github.com/shirou/gopsutil/cpu"
 	"github.com/shirou/gopsutil/disk"
 	"github.com/shirou/gopsutil/host"
@@ -80,445 +82,508 @@ type ProcessStat struct {
 	// MemoryMapsStat []process.MemoryMapsStat
 }
 
+type Message struct {
+	Type    string `json:"type"`
+	Sender  string `json:"sender"`
+	Content string `json:"content"`
+}
+
 func main() {
-	daemonCluster, err := net.Dial("tcp", "localhost:8081")
+	// Connect to WebSocket server
+	conn, err := connect("ws://localhost:8001/ws")
 	if err != nil {
-		panic(err)
-	}
-	defer daemonCluster.Close()
-
-	s := bufio.NewScanner(daemonCluster)
-	for s.Scan() {
-		r := s.Text()
-		fmt.Println("Server response:", r)
-	}
-
-	if err := s.Err(); err != nil {
-		fmt.Println("Error reading:", err)
-		return
-	}
-}
-
-func sendCPUStat(daemonCluster net.Conn) {
-	infoStatList, err := cpu.Info()
-	if err != nil {
-		panic(err)
-	}
-
-	timesStatList, err := cpu.Times(true)
-	if err != nil {
-		panic(err)
-	}
-
-	b, err := json.Marshal(Response{
-		Type: "cpu stat",
-		Data: CPUStat{
-			InfoStatList:  infoStatList,
-			TimesStatList: timesStatList,
-		},
-	})
-	if err != nil {
-		panic(err)
-	}
-
-	_, err = daemonCluster.Write(b)
-	if err != nil {
-		panic(err)
-	}
-}
-
-func sendDiskStatList(daemonCluster net.Conn) {
-	diskStats := []DiskStat{}
-
-	partitionStats, err := disk.Partitions(true)
-	if err != nil {
-		panic(err)
-	}
-
-	for _, partitionStat := range partitionStats {
-		usageStat, err := disk.Usage(partitionStat.Mountpoint)
-		if err != nil {
-			panic(err)
-		}
-
-		ioCountersStats, err := disk.IOCounters(partitionStat.Device)
-		if err != nil {
-			panic(err)
-		}
-
-		diskStat := DiskStat{
-			IOCountersStatList: ioCountersStats,
-			PartitionStat:      partitionStat,
-			UsageStat:          *usageStat,
-		}
-
-		diskStats = append(diskStats, diskStat)
-	}
-
-	b, err := json.Marshal(Response{
-		Type: "disk stat list",
-		Data: diskStats,
-	})
-	if err != nil {
-		panic(err)
-	}
-
-	_, err = daemonCluster.Write(b)
-	if err != nil {
-		panic(err)
-	}
-}
-
-func sendHostStat(daemonCluster net.Conn) {
-	infoStat, err := host.Info()
-	if err != nil {
-		panic(err)
-	}
-
-	temperatureStatList, err := host.SensorsTemperatures()
-	if err != nil {
-		panic(err)
-	}
-
-	userStatList, err := host.Users()
-	if err != nil {
-		panic(err)
-	}
-
-	b, err := json.Marshal(Response{
-		Type: "host stat",
-		Data: HostStat{
-			InfoStat:            *infoStat,
-			TemperatureStatList: temperatureStatList,
-			UserStatList:        userStatList,
-		},
-	})
-	if err != nil {
-		panic(err)
-	}
-
-	_, err = daemonCluster.Write(b)
-	if err != nil {
-		panic(err)
-	}
-}
-
-func sendLoadStat(daemonCluster net.Conn) {
-	avgStat, err := load.Avg()
-	if err != nil {
-		panic(err)
-	}
-
-	miscStat, err := load.Misc()
-	if err != nil {
-		panic(err)
-	}
-
-	b, err := json.Marshal(Response{
-		Type: "load stat",
-		Data: LoadStat{
-			AvgStat:  *avgStat,
-			MiscStat: *miscStat,
-		},
-	})
-	if err != nil {
-		panic(err)
-	}
-
-	_, err = daemonCluster.Write(b)
-	if err != nil {
-		panic(err)
-	}
-}
-
-func sendMemStat(daemonCluster net.Conn) {
-	swapDevices, err := mem.SwapDevices()
-	if err != nil {
-		panic(err)
-	}
-
-	swapMemoryStat, err := mem.SwapMemory()
-	if err != nil {
-		panic(err)
-	}
-
-	virtualMemoryExStat, err := mem.VirtualMemoryEx()
-	if err != nil {
-		panic(err)
-	}
-
-	virtualMemoryStat, err := mem.VirtualMemory()
-	if err != nil {
-		panic(err)
-	}
-
-	b, err := json.Marshal(Response{
-		Type: "disk stat list",
-		Data: MemStat{
-			SwapDeviceList:      swapDevices,
-			SwapMemoryStat:      *swapMemoryStat,
-			VirtualMemoryExStat: *virtualMemoryExStat,
-			VirtualMemoryStat:   *virtualMemoryStat,
-		},
-	})
-	if err != nil {
-		panic(err)
-	}
-
-	_, err = daemonCluster.Write(b)
-	if err != nil {
-		panic(err)
-	}
-}
-
-func sendNetStat(daemonCluster net.Conn) {
-	// .ConnectionsMax
-	// .ConnectionsPidMax
-	// .ConnectionsPidMaxWithoutUids
-	// .ConnectionsPidWithoutUids
-	// "all"
-	// "inet"
-	// "inet4"
-	// "inet6"
-	// "tcp"
-	// "tcp6"
-	// "tcp4"
-	// "udp"
-	// "udp6"
-	// "udp4"
-	// "unix"
-	connectionStatList, err := gopsutilnet.Connections("all")
-	if err != nil {
-		panic(err)
-	}
-
-	conntrackStatListPerCPU, err := gopsutilnet.ConntrackStats(true)
-	if err != nil {
-		// panic(err) panic: open /proc/net/stat/nf_conntrack: no such file or directory
-	}
-
-	conntrackStatAggregation, err := gopsutilnet.ConntrackStats(false)
-	if err != nil {
-		// panic(err) panic: open /proc/net/stat/nf_conntrack: no such file or directory
-	}
-
-	filterStatList, err := gopsutilnet.FilterCounters()
-	if err != nil {
-		// panic(err) panic: open /proc/sys/net/netfilter/nf_conntrack_count: no such file or directory
-	}
-
-	ioCountersStatListPerNIC, err := gopsutilnet.IOCounters(true)
-	if err != nil {
-		panic(err)
-	}
-
-	for _, filterStat := range filterStatList {
-		fmt.Println("ConnTrackCount:", filterStat.ConnTrackCount)
-		fmt.Println("ConnTrackMax:", filterStat.ConnTrackMax)
-	}
-
-	ioCountersStatListAggregation, err := gopsutilnet.IOCounters(true)
-	if err != nil {
-		panic(err)
-	}
-
-	interfaceStatList, err := gopsutilnet.Interfaces()
-	if err != nil {
-		panic(err)
-	}
-
-	//ip,icmp,icmpmsg,tcp,udp,udplite
-	protocols := []string{"tcp"}
-	protoCountersStatList, err := gopsutilnet.ProtoCounters(protocols)
-	if err != nil {
-		panic(err)
-	}
-
-	b, err := json.Marshal(Response{
-		Type: "net stat",
-		Data: NetStat{
-			ConnectionStatList:            connectionStatList,
-			ConntrackStatListPerCPU:       conntrackStatListPerCPU,
-			ConntrackStatListAggregation:  conntrackStatAggregation,
-			FilterStatList:                filterStatList,
-			IOCountersStatListPerNIC:      ioCountersStatListPerNIC,
-			IOCountersStatListAggregation: ioCountersStatListAggregation,
-			InterfaceStatList:             interfaceStatList,
-			ProtoCountersStatList:         protoCountersStatList,
-		},
-	})
-	if err != nil {
-		panic(err)
-	}
-
-	_, err = daemonCluster.Write(b)
-	if err != nil {
-		panic(err)
-	}
-}
-
-func sendProcessStat(daemonCluster net.Conn) {
-	var processStatList []ProcessStat
-
-	pids, err := process.Pids()
-	if err != nil {
-		panic(err)
-	}
-
-	for _, pid := range pids {
-		proc, err := process.NewProcess(pid)
-		if err != nil {
-			fmt.Printf("Error creating process object for PID %d: %s\n", pid, err)
-			panic(err)
-		}
-
-		// ioCountersStat, err := proc.IOCounters()
-		// if err != nil {
-		// 	fmt.Printf("Error retrieving IO counters for PID %d: %s\n", pid, err)
-		// 	// panic(err) panic: open /proc/1/io: permission denied
-		// }
-
-		memoryInfoExStat, err := proc.MemoryInfoEx()
-		if err != nil {
-			fmt.Printf("Error retrieving extended memory info for PID %d: %s\n", pid, err)
-			panic(err)
-		}
-
-		memoryInfoStat, err := proc.MemoryInfo()
-		if err != nil {
-			fmt.Printf("Error retrieving memory info for PID %d: %s\n", pid, err)
-			panic(err)
-		}
-
-		// memoryMapsStatList, err := proc.MemoryMaps(true) // also false
-		// if err != nil {
-		// 	fmt.Printf("Error retrieving memory maps for PID %d: %s\n", pid, err)
-		// 	// panic(err) panic: open /proc/1/smaps: permission denied
-		// }
-
-		numCtxSwitchesStat, err := proc.NumCtxSwitches()
-		if err != nil {
-			fmt.Printf("Error retrieving context switches for PID %d: %s\n", pid, err)
-			panic(err)
-		}
-
-		// openFilesStatList, err := proc.OpenFiles()
-		// if err != nil {
-		// 	fmt.Printf("Error retrieving open files for PID %d: %s\n", pid, err)
-		// 	// panic(err) panic: open /proc/1/smaps: permission denied
-		// }
-
-		// rlimitStatList, err := proc.Rlimit()
-		// if err != nil {
-		// 	fmt.Printf("Error retrieving resource limits for PID %d: %s\n", pid, err)
-		// 	panic(err)
-		// } Not working, TOOD: Fork, fix, and pull request
-
-		// fmt.Println(ioCountersStat.ReadBytes)
-		// fmt.Println(ioCountersStat.ReadCount)
-		// fmt.Println(ioCountersStat.WriteBytes)
-		// fmt.Println(ioCountersStat.WriteCount)
-		// if panic above then: Error retrieving IO counters for PID 1: open /proc/1/io: permission denied
-
-		// for _, memoryMapsStat := range *memoryMapsStatList {
-		// 	fmt.Println(memoryMapsStat.Anonymous)
-		// 	fmt.Println(memoryMapsStat.Path)
-		// 	fmt.Println(memoryMapsStat.PrivateClean)
-		// 	fmt.Println(memoryMapsStat.PrivateDirty)
-		// 	fmt.Println(memoryMapsStat.Pss)
-		// 	fmt.Println(memoryMapsStat.Referenced)
-		// 	fmt.Println(memoryMapsStat.Rss)
-		// 	fmt.Println(memoryMapsStat.SharedClean)
-		// 	fmt.Println(memoryMapsStat.SharedDirty)
-		// 	fmt.Println(memoryMapsStat.Size)
-		// 	fmt.Println(memoryMapsStat.Swap)
-		// }
-		// Error retrieving memory maps for PID 1: open /proc/1/smaps: permission denied
-
-		// for _, openFilesStat := range openFilesStatList {
-		// 	fmt.Println(openFilesStat.Fd)
-		// 	fmt.Println(openFilesStat.Path)
-		// }
-		// Error retrieving open files for PID 1: open /proc/1/fd: permission denied
-
-		// for _, rlimitStat := range rlimitStatList {
-		// 	fmt.Println(rlimitStat.Hard)
-		// 	fmt.Println(rlimitStat.Resource)
-		// 	fmt.Println(rlimitStat.Soft)
-		// 	fmt.Println(rlimitStat.Used)
-		// } // Not working
-
-		processStatList = append(processStatList, ProcessStat{
-			MemoryInfoExStat:   *memoryInfoExStat,
-			MemoryInfoStat:     *memoryInfoStat,
-			NumCtxSwitchesStat: *numCtxSwitchesStat,
-		})
-	}
-
-	b, err := json.Marshal(Response{
-		Type: "process stat list",
-		Data: processStatList,
-	})
-	if err != nil {
-		panic(err)
-	}
-
-	_, err = daemonCluster.Write(b)
-	if err != nil {
-		panic(err)
-	}
-}
-
-func powerOnRemoteDesk(macAddr string) error {
-	// Parse MAC address
-	mac, err := net.ParseMAC(macAddr)
-	if err != nil {
-		return fmt.Errorf("error parsing MAC address: %v", err)
-	}
-
-	// Create magic packet
-	magicPacket := []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}
-	for i := 0; i < 16; i++ {
-		magicPacket = append(magicPacket, mac...)
-	}
-
-	// Resolve broadcast address
-	broadcastAddr := net.IPv4(255, 255, 255, 255)
-
-	// Setup UDP connection
-	udpAddr := &net.UDPAddr{
-		IP:   broadcastAddr,
-		Port: 9,
-	}
-	conn, err := net.DialUDP("udp", nil, udpAddr)
-	if err != nil {
-		return fmt.Errorf("error setting up UDP connection: %v", err)
+		log.Fatalf("failed to connect to server: %v", err)
 	}
 	defer conn.Close()
 
-	// Send magic packet
-	if _, err := conn.Write(magicPacket); err != nil {
-		return fmt.Errorf("error sending magic packet: %v", err)
-	}
+	// Start a goroutine to handle incoming messages from the server
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			var msg Message
+			if err := conn.ReadJSON(&msg); err != nil {
+				log.Println("read:", err)
+				break
+			}
+			fmt.Printf("%s: %s\n", msg.Sender, msg.Content)
+		}
+	}()
 
-	return nil
+	// Start a goroutine to read user input and send messages to the server
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		reader := bufio.NewReader(os.Stdin)
+		for {
+			fmt.Print("Enter message (text/command): ")
+			text, _ := reader.ReadString('\n')
+			text = text[:len(text)-1] // Remove newline character
+
+			var msgType string
+			if text == "/command" {
+				msgType = "command"
+			} else {
+				msgType = "text"
+			}
+
+			msg := Message{
+				Type:    msgType,
+				Sender:  "Client",
+				Content: text,
+			}
+
+			err := conn.WriteJSON(msg)
+			if err != nil {
+				log.Println("write:", err)
+				break
+			}
+		}
+	}()
+
+	// Wait for interrupt signal (e.g., Ctrl+C)
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt, syscall.SIGTERM)
+	<-interrupt
+
+	// Close connection gracefully
+	err = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+	if err != nil {
+		log.Println("write close:", err)
+	}
+	wg.Wait()
 }
 
-func powerOffLocalDesk() error {
-	var cmd *exec.Cmd
-	switch os := runtime.GOOS; os {
-	case "windows":
-		cmd = exec.Command("shutdown", "/s", "/t", "0")
-	case "linux":
-		cmd = exec.Command("shutdown", "-h", "now")
-	case "darwin":
-		cmd = exec.Command("sudo", "shutdown", "-h", "now")
-	default:
-		return fmt.Errorf("unsupported operating system: %s", os)
+// connect establishes a WebSocket connection to the specified URL
+func connect(url string) (*websocket.Conn, error) {
+	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to WebSocket server: %w", err)
 	}
-
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("error shutting down computer: %v", err)
-	}
-	return nil
+	return conn, nil
 }
+
+// func sendCPUStat(daemonCluster net.Conn) {
+// 	infoStatList, err := cpu.Info()
+// 	if err != nil {
+// 		panic(err)
+// 	}
+
+// 	timesStatList, err := cpu.Times(true)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+
+// 	b, err := json.Marshal(Response{
+// 		Type: "cpu stat",
+// 		Data: CPUStat{
+// 			InfoStatList:  infoStatList,
+// 			TimesStatList: timesStatList,
+// 		},
+// 	})
+// 	if err != nil {
+// 		panic(err)
+// 	}
+
+// 	_, err = daemonCluster.Write(b)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// }
+
+// func sendDiskStatList(daemonCluster net.Conn) {
+// 	diskStats := []DiskStat{}
+
+// 	partitionStats, err := disk.Partitions(true)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+
+// 	for _, partitionStat := range partitionStats {
+// 		usageStat, err := disk.Usage(partitionStat.Mountpoint)
+// 		if err != nil {
+// 			panic(err)
+// 		}
+
+// 		ioCountersStats, err := disk.IOCounters(partitionStat.Device)
+// 		if err != nil {
+// 			panic(err)
+// 		}
+
+// 		diskStat := DiskStat{
+// 			IOCountersStatList: ioCountersStats,
+// 			PartitionStat:      partitionStat,
+// 			UsageStat:          *usageStat,
+// 		}
+
+// 		diskStats = append(diskStats, diskStat)
+// 	}
+
+// 	b, err := json.Marshal(Response{
+// 		Type: "disk stat list",
+// 		Data: diskStats,
+// 	})
+// 	if err != nil {
+// 		panic(err)
+// 	}
+
+// 	_, err = daemonCluster.Write(b)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// }
+
+// func sendHostStat(daemonCluster net.Conn) {
+// 	infoStat, err := host.Info()
+// 	if err != nil {
+// 		panic(err)
+// 	}
+
+// 	temperatureStatList, err := host.SensorsTemperatures()
+// 	if err != nil {
+// 		panic(err)
+// 	}
+
+// 	userStatList, err := host.Users()
+// 	if err != nil {
+// 		panic(err)
+// 	}
+
+// 	b, err := json.Marshal(Response{
+// 		Type: "host stat",
+// 		Data: HostStat{
+// 			InfoStat:            *infoStat,
+// 			TemperatureStatList: temperatureStatList,
+// 			UserStatList:        userStatList,
+// 		},
+// 	})
+// 	if err != nil {
+// 		panic(err)
+// 	}
+
+// 	_, err = daemonCluster.Write(b)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// }
+
+// func sendLoadStat(daemonCluster net.Conn) {
+// 	avgStat, err := load.Avg()
+// 	if err != nil {
+// 		panic(err)
+// 	}
+
+// 	miscStat, err := load.Misc()
+// 	if err != nil {
+// 		panic(err)
+// 	}
+
+// 	b, err := json.Marshal(Response{
+// 		Type: "load stat",
+// 		Data: LoadStat{
+// 			AvgStat:  *avgStat,
+// 			MiscStat: *miscStat,
+// 		},
+// 	})
+// 	if err != nil {
+// 		panic(err)
+// 	}
+
+// 	_, err = daemonCluster.Write(b)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// }
+
+// func sendMemStat(daemonCluster net.Conn) {
+// 	swapDevices, err := mem.SwapDevices()
+// 	if err != nil {
+// 		panic(err)
+// 	}
+
+// 	swapMemoryStat, err := mem.SwapMemory()
+// 	if err != nil {
+// 		panic(err)
+// 	}
+
+// 	virtualMemoryExStat, err := mem.VirtualMemoryEx()
+// 	if err != nil {
+// 		panic(err)
+// 	}
+
+// 	virtualMemoryStat, err := mem.VirtualMemory()
+// 	if err != nil {
+// 		panic(err)
+// 	}
+
+// 	b, err := json.Marshal(Response{
+// 		Type: "disk stat list",
+// 		Data: MemStat{
+// 			SwapDeviceList:      swapDevices,
+// 			SwapMemoryStat:      *swapMemoryStat,
+// 			VirtualMemoryExStat: *virtualMemoryExStat,
+// 			VirtualMemoryStat:   *virtualMemoryStat,
+// 		},
+// 	})
+// 	if err != nil {
+// 		panic(err)
+// 	}
+
+// 	_, err = daemonCluster.Write(b)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// }
+
+// func sendNetStat(daemonCluster net.Conn) {
+// 	// .ConnectionsMax
+// 	// .ConnectionsPidMax
+// 	// .ConnectionsPidMaxWithoutUids
+// 	// .ConnectionsPidWithoutUids
+// 	// "all"
+// 	// "inet"
+// 	// "inet4"
+// 	// "inet6"
+// 	// "tcp"
+// 	// "tcp6"
+// 	// "tcp4"
+// 	// "udp"
+// 	// "udp6"
+// 	// "udp4"
+// 	// "unix"
+// 	connectionStatList, err := gopsutilnet.Connections("all")
+// 	if err != nil {
+// 		panic(err)
+// 	}
+
+// 	conntrackStatListPerCPU, err := gopsutilnet.ConntrackStats(true)
+// 	if err != nil {
+// 		// panic(err) panic: open /proc/net/stat/nf_conntrack: no such file or directory
+// 	}
+
+// 	conntrackStatAggregation, err := gopsutilnet.ConntrackStats(false)
+// 	if err != nil {
+// 		// panic(err) panic: open /proc/net/stat/nf_conntrack: no such file or directory
+// 	}
+
+// 	filterStatList, err := gopsutilnet.FilterCounters()
+// 	if err != nil {
+// 		// panic(err) panic: open /proc/sys/net/netfilter/nf_conntrack_count: no such file or directory
+// 	}
+
+// 	ioCountersStatListPerNIC, err := gopsutilnet.IOCounters(true)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+
+// 	for _, filterStat := range filterStatList {
+// 		fmt.Println("ConnTrackCount:", filterStat.ConnTrackCount)
+// 		fmt.Println("ConnTrackMax:", filterStat.ConnTrackMax)
+// 	}
+
+// 	ioCountersStatListAggregation, err := gopsutilnet.IOCounters(true)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+
+// 	interfaceStatList, err := gopsutilnet.Interfaces()
+// 	if err != nil {
+// 		panic(err)
+// 	}
+
+// 	//ip,icmp,icmpmsg,tcp,udp,udplite
+// 	protocols := []string{"tcp"}
+// 	protoCountersStatList, err := gopsutilnet.ProtoCounters(protocols)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+
+// 	b, err := json.Marshal(Response{
+// 		Type: "net stat",
+// 		Data: NetStat{
+// 			ConnectionStatList:            connectionStatList,
+// 			ConntrackStatListPerCPU:       conntrackStatListPerCPU,
+// 			ConntrackStatListAggregation:  conntrackStatAggregation,
+// 			FilterStatList:                filterStatList,
+// 			IOCountersStatListPerNIC:      ioCountersStatListPerNIC,
+// 			IOCountersStatListAggregation: ioCountersStatListAggregation,
+// 			InterfaceStatList:             interfaceStatList,
+// 			ProtoCountersStatList:         protoCountersStatList,
+// 		},
+// 	})
+// 	if err != nil {
+// 		panic(err)
+// 	}
+
+// 	_, err = daemonCluster.Write(b)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// }
+
+// func sendProcessStat(daemonCluster net.Conn) {
+// 	var processStatList []ProcessStat
+
+// 	pids, err := process.Pids()
+// 	if err != nil {
+// 		panic(err)
+// 	}
+
+// 	for _, pid := range pids {
+// 		proc, err := process.NewProcess(pid)
+// 		if err != nil {
+// 			fmt.Printf("Error creating process object for PID %d: %s\n", pid, err)
+// 			panic(err)
+// 		}
+
+// 		// ioCountersStat, err := proc.IOCounters()
+// 		// if err != nil {
+// 		// 	fmt.Printf("Error retrieving IO counters for PID %d: %s\n", pid, err)
+// 		// 	// panic(err) panic: open /proc/1/io: permission denied
+// 		// }
+
+// 		memoryInfoExStat, err := proc.MemoryInfoEx()
+// 		if err != nil {
+// 			fmt.Printf("Error retrieving extended memory info for PID %d: %s\n", pid, err)
+// 			panic(err)
+// 		}
+
+// 		memoryInfoStat, err := proc.MemoryInfo()
+// 		if err != nil {
+// 			fmt.Printf("Error retrieving memory info for PID %d: %s\n", pid, err)
+// 			panic(err)
+// 		}
+
+// 		// memoryMapsStatList, err := proc.MemoryMaps(true) // also false
+// 		// if err != nil {
+// 		// 	fmt.Printf("Error retrieving memory maps for PID %d: %s\n", pid, err)
+// 		// 	// panic(err) panic: open /proc/1/smaps: permission denied
+// 		// }
+
+// 		numCtxSwitchesStat, err := proc.NumCtxSwitches()
+// 		if err != nil {
+// 			fmt.Printf("Error retrieving context switches for PID %d: %s\n", pid, err)
+// 			panic(err)
+// 		}
+
+// 		// openFilesStatList, err := proc.OpenFiles()
+// 		// if err != nil {
+// 		// 	fmt.Printf("Error retrieving open files for PID %d: %s\n", pid, err)
+// 		// 	// panic(err) panic: open /proc/1/smaps: permission denied
+// 		// }
+
+// 		// rlimitStatList, err := proc.Rlimit()
+// 		// if err != nil {
+// 		// 	fmt.Printf("Error retrieving resource limits for PID %d: %s\n", pid, err)
+// 		// 	panic(err)
+// 		// } Not working, TOOD: Fork, fix, and pull request
+
+// 		// fmt.Println(ioCountersStat.ReadBytes)
+// 		// fmt.Println(ioCountersStat.ReadCount)
+// 		// fmt.Println(ioCountersStat.WriteBytes)
+// 		// fmt.Println(ioCountersStat.WriteCount)
+// 		// if panic above then: Error retrieving IO counters for PID 1: open /proc/1/io: permission denied
+
+// 		// for _, memoryMapsStat := range *memoryMapsStatList {
+// 		// 	fmt.Println(memoryMapsStat.Anonymous)
+// 		// 	fmt.Println(memoryMapsStat.Path)
+// 		// 	fmt.Println(memoryMapsStat.PrivateClean)
+// 		// 	fmt.Println(memoryMapsStat.PrivateDirty)
+// 		// 	fmt.Println(memoryMapsStat.Pss)
+// 		// 	fmt.Println(memoryMapsStat.Referenced)
+// 		// 	fmt.Println(memoryMapsStat.Rss)
+// 		// 	fmt.Println(memoryMapsStat.SharedClean)
+// 		// 	fmt.Println(memoryMapsStat.SharedDirty)
+// 		// 	fmt.Println(memoryMapsStat.Size)
+// 		// 	fmt.Println(memoryMapsStat.Swap)
+// 		// }
+// 		// Error retrieving memory maps for PID 1: open /proc/1/smaps: permission denied
+
+// 		// for _, openFilesStat := range openFilesStatList {
+// 		// 	fmt.Println(openFilesStat.Fd)
+// 		// 	fmt.Println(openFilesStat.Path)
+// 		// }
+// 		// Error retrieving open files for PID 1: open /proc/1/fd: permission denied
+
+// 		// for _, rlimitStat := range rlimitStatList {
+// 		// 	fmt.Println(rlimitStat.Hard)
+// 		// 	fmt.Println(rlimitStat.Resource)
+// 		// 	fmt.Println(rlimitStat.Soft)
+// 		// 	fmt.Println(rlimitStat.Used)
+// 		// } // Not working
+
+// 		processStatList = append(processStatList, ProcessStat{
+// 			MemoryInfoExStat:   *memoryInfoExStat,
+// 			MemoryInfoStat:     *memoryInfoStat,
+// 			NumCtxSwitchesStat: *numCtxSwitchesStat,
+// 		})
+// 	}
+
+// 	b, err := json.Marshal(Response{
+// 		Type: "process stat list",
+// 		Data: processStatList,
+// 	})
+// 	if err != nil {
+// 		panic(err)
+// 	}
+
+// 	_, err = daemonCluster.Write(b)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// }
+
+// func powerOnRemoteDesk(macAddr string) error {
+// 	// Parse MAC address
+// 	mac, err := net.ParseMAC(macAddr)
+// 	if err != nil {
+// 		return fmt.Errorf("error parsing MAC address: %v", err)
+// 	}
+
+// 	// Create magic packet
+// 	magicPacket := []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}
+// 	for i := 0; i < 16; i++ {
+// 		magicPacket = append(magicPacket, mac...)
+// 	}
+
+// 	// Resolve broadcast address
+// 	broadcastAddr := net.IPv4(255, 255, 255, 255)
+
+// 	// Setup UDP connection
+// 	udpAddr := &net.UDPAddr{
+// 		IP:   broadcastAddr,
+// 		Port: 9,
+// 	}
+// 	conn, err := net.DialUDP("udp", nil, udpAddr)
+// 	if err != nil {
+// 		return fmt.Errorf("error setting up UDP connection: %v", err)
+// 	}
+// 	defer conn.Close()
+
+// 	// Send magic packet
+// 	if _, err := conn.Write(magicPacket); err != nil {
+// 		return fmt.Errorf("error sending magic packet: %v", err)
+// 	}
+
+// 	return nil
+// }
+
+// func powerOffLocalDesk() error {
+// 	var cmd *exec.Cmd
+// 	switch os := runtime.GOOS; os {
+// 	case "windows":
+// 		cmd = exec.Command("shutdown", "/s", "/t", "0")
+// 	case "linux":
+// 		cmd = exec.Command("shutdown", "-h", "now")
+// 	case "darwin":
+// 		cmd = exec.Command("sudo", "shutdown", "-h", "now")
+// 	default:
+// 		return fmt.Errorf("unsupported operating system: %s", os)
+// 	}
+
+// 	if err := cmd.Run(); err != nil {
+// 		return fmt.Errorf("error shutting down computer: %v", err)
+// 	}
+// 	return nil
+// }
