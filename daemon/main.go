@@ -1,13 +1,13 @@
 package main
 
 import (
-	"bufio"
+	"flag"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"os/signal"
-	"sync"
-	"syscall"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/shirou/gopsutil/cpu"
@@ -83,85 +83,96 @@ type ProcessStat struct {
 }
 
 type Message struct {
-	Type    string `json:"type"`
-	Sender  string `json:"sender"`
-	Content string `json:"content"`
+	Data   interface{} `json:"data"`
+	Sender string      `json:"sender"`
+	Type   string      `json:"type"`
 }
+
+var addr = flag.String("addr", "localhost:8080", "http service address")
 
 func main() {
-	// Connect to WebSocket server
-	conn, err := connect("ws://localhost:8001/ws")
-	if err != nil {
-		log.Fatalf("failed to connect to server: %v", err)
-	}
-	defer conn.Close()
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt)
 
-	// Start a goroutine to handle incoming messages from the server
-	wg := sync.WaitGroup{}
-	wg.Add(1)
+	u := url.URL{Scheme: "ws", Host: *addr, Path: "/"}
+
+	log.Printf("connecting to %s", u.String())
+
+	c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	if err != nil {
+		log.Fatal("dial:", err)
+	}
+	defer c.Close()
+
+	done := make(chan struct{})
+
 	go func() {
-		defer wg.Done()
+		defer close(done)
+
 		for {
 			var msg Message
-			if err := conn.ReadJSON(&msg); err != nil {
-				log.Println("read:", err)
-				break
+			err := c.ReadJSON(&msg)
+			if err != nil {
+				log.Println("read json:", err)
 			}
-			fmt.Printf("%s: %s\n", msg.Sender, msg.Content)
+
+			switch data := msg.Data.(type) {
+			case nil:
+				switch msg.Sender {
+				case "daemon cluster":
+					fmt.Println(data)
+					switch msg.Type {
+					case "disk stat list":
+						sendDiskStatList(c)
+					default:
+						fmt.Println("Unexpected msg.Type")
+					}
+				default:
+					fmt.Println("Unexpected msg.Sender")
+				}
+			case map[string]interface{}:
+			case []interface{}:
+			default:
+				fmt.Println("Unexpected msg.Data.(type)")
+			}
+
+			switch msg.Sender {
+			case "daemon":
+				switch msg.Type {
+
+				}
+			}
 		}
 	}()
 
-	// Start a goroutine to read user input and send messages to the server
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		reader := bufio.NewReader(os.Stdin)
-		for {
-			fmt.Print("Enter message (text/command): ")
-			text, _ := reader.ReadString('\n')
-			text = text[:len(text)-1] // Remove newline character
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
 
-			var msgType string
-			if text == "/command" {
-				msgType = "command"
-			} else {
-				msgType = "text"
-			}
-
-			msg := Message{
-				Type:    msgType,
-				Sender:  "Client",
-				Content: text,
-			}
-
-			err := conn.WriteJSON(msg)
+	for {
+		select {
+		case <-done:
+			return
+		case t := <-ticker.C:
+			err := c.WriteJSON(t.String())
 			if err != nil {
 				log.Println("write:", err)
-				break
 			}
+		case <-interrupt:
+			log.Println("interrupt")
+
+			err := c.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+			if err != nil {
+				log.Println("write close:", err)
+				return
+			}
+
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+			}
+			return
 		}
-	}()
-
-	// Wait for interrupt signal (e.g., Ctrl+C)
-	interrupt := make(chan os.Signal, 1)
-	signal.Notify(interrupt, os.Interrupt, syscall.SIGTERM)
-	<-interrupt
-
-	// Close connection gracefully
-	err = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-	if err != nil {
-		log.Println("write close:", err)
 	}
-	wg.Wait()
-}
-
-// connect establishes a WebSocket connection to the specified URL
-func connect(url string) (*websocket.Conn, error) {
-	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to WebSocket server: %w", err)
-	}
-	return conn, nil
 }
 
 // func sendCPUStat(daemonCluster net.Conn) {
@@ -192,47 +203,40 @@ func connect(url string) (*websocket.Conn, error) {
 // 	}
 // }
 
-// func sendDiskStatList(daemonCluster net.Conn) {
-// 	diskStats := []DiskStat{}
+func sendDiskStatList(c *websocket.Conn) {
+	diskStatList := []DiskStat{}
 
-// 	partitionStats, err := disk.Partitions(true)
-// 	if err != nil {
-// 		panic(err)
-// 	}
+	partitionStats, err := disk.Partitions(true)
+	if err != nil {
+		panic(err)
+	}
 
-// 	for _, partitionStat := range partitionStats {
-// 		usageStat, err := disk.Usage(partitionStat.Mountpoint)
-// 		if err != nil {
-// 			panic(err)
-// 		}
+	for _, partitionStat := range partitionStats {
+		usageStat, err := disk.Usage(partitionStat.Mountpoint)
+		if err != nil {
+			panic(err)
+		}
 
-// 		ioCountersStats, err := disk.IOCounters(partitionStat.Device)
-// 		if err != nil {
-// 			panic(err)
-// 		}
+		ioCountersStats, err := disk.IOCounters(partitionStat.Device)
+		if err != nil {
+			panic(err)
+		}
 
-// 		diskStat := DiskStat{
-// 			IOCountersStatList: ioCountersStats,
-// 			PartitionStat:      partitionStat,
-// 			UsageStat:          *usageStat,
-// 		}
+		diskStat := DiskStat{
+			IOCountersStatList: ioCountersStats,
+			PartitionStat:      partitionStat,
+			UsageStat:          *usageStat,
+		}
 
-// 		diskStats = append(diskStats, diskStat)
-// 	}
+		diskStatList = append(diskStatList, diskStat)
+	}
 
-// 	b, err := json.Marshal(Response{
-// 		Type: "disk stat list",
-// 		Data: diskStats,
-// 	})
-// 	if err != nil {
-// 		panic(err)
-// 	}
-
-// 	_, err = daemonCluster.Write(b)
-// 	if err != nil {
-// 		panic(err)
-// 	}
-// }
+	msg := Message{Data: diskStatList, Sender: "daemon", Type: "dist stat list"}
+	err = c.WriteJSON(msg)
+	if err != nil {
+		log.Println(err)
+	}
+}
 
 // func sendHostStat(daemonCluster net.Conn) {
 // 	infoStat, err := host.Info()

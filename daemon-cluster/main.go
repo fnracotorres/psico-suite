@@ -1,13 +1,12 @@
 package main
 
 import (
-	"context"
-	"fmt"
+	"encoding/json"
+	"flag"
 	"log"
-	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
-	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -83,166 +82,75 @@ type ProcessStat struct {
 	// MemoryMapsStat []process.MemoryMapsStat
 }
 
-type Message struct {
-	Type      string `json:"type"`
-	Sender    string `json:"sender"`
-	Recipient string `json:"recipient"`
-	Content   string `json:"content"`
-}
-
-var clients = make(map[*websocket.Conn]bool) // connected clients
-var broadcast = make(chan Message)           // broadcast channel
-
-// Define a welcome message for the server
-var welcomeMessage = Message{
-	Type:      "info",
-	Sender:    "Server",
-	Recipient: "All",
-	Content:   "Welcome to the chat!",
-}
-
-func connect(url string) (*websocket.Conn, error) {
-	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to WebSocket server: %w", err)
-	}
-	return conn, nil
-}
+var addr = flag.String("addr", "localhost:8080", "http service address")
 
 func main() {
-	// Connect to WebSocket server
-	conn, err := connect("ws://localhost:8000/ws")
-	if err != nil {
-		log.Fatalf("failed to connect to server: %v", err)
-	}
-	defer conn.Close()
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt)
 
-	// Start a goroutine to handle incoming messages from the server
-	wg := sync.WaitGroup{}
-	wg.Add(1)
+	u := url.URL{Scheme: "ws", Host: *addr, Path: "/echo"}
+	log.Printf("connecting to %s", u.String())
+
+	c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	if err != nil {
+		log.Fatal("dial:", err)
+	}
+	defer c.Close()
+
+	done := make(chan struct{})
+
 	go func() {
-		defer wg.Done()
+		defer close(done)
 		for {
-			var msg Message
-			if err := conn.ReadJSON(&msg); err != nil {
-				log.Println("read:", err)
-				break
-			}
-			fmt.Printf("%s: %s\n", msg.Sender, msg.Content)
-		}
-	}()
-
-	// Close connection gracefully
-	err = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-	if err != nil {
-		log.Println("write close:", err)
-	}
-	wg.Wait()
-
-	// Create a new Gorilla WebSocket router
-	router := http.NewServeMux()
-	router.HandleFunc("/ws", handleConnections)
-
-	// Create a HTTP server with graceful shutdown
-	server := &http.Server{
-		Addr:    ":8001",
-		Handler: router,
-	}
-
-	// Start the server in a separate goroutine
-	go func() {
-		log.Println("Server started on :8000")
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("ListenAndServe: %v", err)
-		}
-	}()
-
-	// Start handling messages
-	go handleMessages()
-
-	// Handle graceful shutdown
-	gracefulShutdown(server)
-}
-
-// handleConnections upgrades initial HTTP requests to WebSocket connections
-func handleConnections(w http.ResponseWriter, r *http.Request) {
-	// Upgrade initial GET request to a WebSocket
-	ws, err := websocket.Upgrade(w, r, nil, 1024, 1024)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-	defer ws.Close()
-
-	// Register client
-	clients[ws] = true
-
-	// Send welcome message to client
-	err = ws.WriteJSON(welcomeMessage)
-	if err != nil {
-		log.Printf("error sending welcome message: %v", err)
-		return
-	}
-
-	// Read incoming messages from client
-	for {
-		var msg Message
-		err := ws.ReadJSON(&msg)
-		if err != nil {
-			log.Printf("error reading message: %v", err)
-			delete(clients, ws)
-			break
-		}
-		handleMessage(msg)
-	}
-}
-
-// handleMessage processes different types of messages
-func handleMessage(msg Message) {
-	switch msg.Type {
-	case "text":
-		broadcast <- msg
-	case "command":
-		// Handle command messages
-		fmt.Printf("Received command from %s: %s\n", msg.Sender, msg.Content)
-	default:
-		fmt.Printf("Unknown message type: %s\n", msg.Type)
-	}
-}
-
-// handleMessages broadcasts messages to all connected clients
-func handleMessages() {
-	for {
-		msg := <-broadcast
-		for client := range clients {
-			err := client.WriteJSON(msg)
+			_, b, err := c.ReadMessage()
 			if err != nil {
-				log.Printf("error writing message: %v", err)
-				client.Close()
-				delete(clients, client)
+				log.Println("read:", err)
+				return
 			}
+
+			var msg []byte
+			if err := json.Unmarshal(b, &msg); err != nil {
+				panic(err)
+			}
+
+			log.Println("Message: ", string(msg))
 		}
-	}
-}
+	}()
 
-// gracefulShutdown handles server shutdown gracefully
-func gracefulShutdown(server *http.Server) {
-	// Create a channel to listen for interrupt and terminate signals
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt)
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
 
-	// Wait for the interrupt signal
-	<-stop
+	for {
+		select {
+		case <-done:
+			return
+		case t := <-ticker.C:
+			timestamp, err := json.Marshal([]byte(t.String()))
+			if err != nil {
+				panic(err)
+			}
 
-	// Create a context with a timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+			err = c.WriteMessage(websocket.TextMessage, timestamp)
+			if err != nil {
+				log.Println("write:", err)
+				return
+			}
+		case <-interrupt:
+			log.Println("interrupt")
 
-	// Shutdown the server
-	if err := server.Shutdown(ctx); err != nil {
-		log.Printf("Shutdown: %v", err)
-	} else {
-		log.Println("Server gracefully stopped")
+			// Cleanly close the connection by sending a close message and then
+			// waiting (with timeout) for the server to close the connection.
+			err := c.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+			if err != nil {
+				log.Println("write close:", err)
+				return
+			}
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+			}
+			return
+		}
 	}
 }
 
